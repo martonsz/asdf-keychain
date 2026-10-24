@@ -5,19 +5,17 @@ set -euo pipefail
 current_script_path=${BASH_SOURCE[0]}
 plugin_dir=$(dirname "$(dirname "$current_script_path")")
 
-# shellcheck source=./lib/utils.bash
+# shellcheck source=/dev/null
 source "${plugin_dir}/lib/utils.bash"
 
+# Download to a scratch dir first so a failed download leaves no files behind
+# in ASDF_DOWNLOAD_PATH.
+scratch_dir=$(mktemp -d)
+trap 'rm -rf "$scratch_dir"' EXIT
+
+# The release asset is a self-contained zipapp, so there is nothing to extract.
+download_release "$ASDF_INSTALL_VERSION" "$scratch_dir/$TOOL_NAME"
+chmod +x "$scratch_dir/$TOOL_NAME"
+
 mkdir -p "$ASDF_DOWNLOAD_PATH"
-
-# TODO: Adapt this to proper extension and adapt extracting strategy.
-release_file="$ASDF_DOWNLOAD_PATH/$TOOL_NAME-$ASDF_INSTALL_VERSION.tar.gz"
-
-# Download tar.gz file to the download directory
-download_release "$ASDF_INSTALL_VERSION" "$release_file"
-
-#  Extract contents of tar.gz file into the download directory
-tar -xzf "$release_file" -C "$ASDF_DOWNLOAD_PATH" --strip-components=1 || fail "Could not extract $release_file"
-
-# Remove the tar.gz file since we don't need to keep it
-rm "$release_file"
+mv "$scratch_dir/$TOOL_NAME" "$ASDF_DOWNLOAD_PATH/$TOOL_NAME"

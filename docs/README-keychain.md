@@ -1,0 +1,575 @@
+# Keychain 3
+
+Keychain orchestrates `ssh-agent` and gives you one coordinated, long-running SSH agent per user and host. For GnuPG, Keychain can also auto-warm your signing and encryption keys so they are ready for use.
+
+Keychain 3 is the evolution of the original Bourne shell-based tool created by Daniel Robbins in 2001. It preserves the single-file deployment model that made Keychain useful for over two decades, while adding modern capabilities: coordinated multi-terminal activation, stable agent sockets, seamless cron and script integration, PKCS#11 hardware key support, explicit GPG credential warm-up, hardened security defaults, and a comprehensive test suite of 700+ unit and integration tests — now written in Python and distributed as a self-contained executable zipapp with no third-party Python dependencies.
+
+For background on the decision to rewrite Keychain in Python, see [Why Keychain 3 Uses Python](https://kernel-seeds.org/projects/keychain/why-python/).
+
+## The Agent Problem Keychain Solves
+
+SSH is amazing, but entering your passphrase every time you open a terminal gets old fast. The standard `ssh-agent` helps, but it has limitations:
+
+- **One agent per login session** — open a new terminal, get a new agent, enter your passphrase again
+- **Cron jobs can't find your agent** — background processes run in a different session
+- **No ssh-agent coordination** — individual ssh-agent processes are not aware of each other.
+
+**Keychain fixes all of this:**
+
+- **One agent per host** — all terminals share the same long-running agent
+- **Persistent state** — cron jobs, remote sessions, and background tasks can all reconnect
+- **Multi-terminal coordination** — when VS Code restores 5 login terminals at once, they cooperate instead of duplicating effort or competing
+
+## The Keychain Difference
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Without Keychain:                                          │
+│                                                             │
+│  Terminal 1 → ssh-agent (prompt)                            │
+│  Terminal 2 → ssh-agent (prompt again)                      │
+│  Terminal 3 → ssh-agent (prompt again)                      │
+│  Cron job → no agent (fails)                                │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│  With Keychain:                                             │
+│                                                             │
+│  Terminal 1 ─┐                                              │
+│  Terminal 2 ─┼→ single ssh-agent (prompt once)              │
+│  Terminal 3 ─┤    ↓                                         │
+│  Cron job ───┘    all terminals reconnect automatically     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Installation
+
+Keychain 3 ships as a **Python zipapp** — a single executable file with no third-party Python dependencies. It needs Python 3.9 or newer and the standard OpenSSH tools (`ssh-agent` and `ssh-add`); GPG features also require GnuPG.
+
+### Install System-Wide
+
+```bash
+# Download from https://github.com/danielrobbins/keychain/releases
+chmod +x keychain-3.0.0.pyz
+sudo cp keychain-3.0.0.pyz /usr/local/bin/keychain
+sudo chmod 755 /usr/local/bin/keychain
+
+# Verify installation
+keychain version
+```
+
+### Verify It's Auditable
+
+Want to inspect the source? The zipapp is just a zip file:
+
+```bash
+unzip -l /usr/local/bin/keychain
+```
+
+No hidden dependencies, no mystery code — everything is right there.
+
+### Platform Support
+
+Keychain 3 is designed for POSIX-like systems with Python 3.9+ and OpenSSH, and optionally GnuPG. That includes Linux, macOS, WSL, Git Bash, the BSDs, Solaris-derived systems, and similar UNIX-like environments. Native Windows is not a supported target yet, but Windows users can run Keychain through WSL or Git Bash.
+
+## 60-Second Quick Start
+
+Choose the recipe for your shell and replace the example filenames in `KEYCHAIN_KEYS` with your keys. Keep one key per line and quote filenames containing spaces. Interactive terminals load your keys; non-interactive login shells establish the agent environment without prompting, so graphical login does not wait for input.
+
+### Bash
+
+Add this to `~/.bash_profile`, keeping any existing configuration:
+
+```bash
+KEYCHAIN_KEYS=(
+    ~/.ssh/id_ed25519
+    ~/.ssh/id_rsa
+)
+
+if [[ $- == *i* ]]; then
+    eval "$(keychain add --eval "${KEYCHAIN_KEYS[@]}")"
+else
+    eval "$(keychain add --eval --noask)"
+fi
+```
+
+For a complete alternative using `.bashrc`, run `keychain man topic:env`.
+
+### Zsh
+
+Add this to `~/.zshrc`, which is read only by interactive shells:
+
+```zsh
+KEYCHAIN_KEYS=(
+    ~/.ssh/id_ed25519
+    ~/.ssh/id_rsa
+)
+eval "$(keychain add --eval "${KEYCHAIN_KEYS[@]}")"
+```
+
+For agent setup during non-interactive login, see `keychain man topic:env`.
+
+### Fish
+
+Add this to `~/.config/fish/config.fish`, keeping any existing configuration:
+
+```fish
+set KEYCHAIN_KEYS \
+    ~/.ssh/id_ed25519 \
+    ~/.ssh/id_rsa
+
+if status is-interactive
+    eval "$(keychain add --eval $KEYCHAIN_KEYS)"
+else if status is-login
+    eval "$(keychain add --eval --noask)"
+end
+```
+
+**What just happened?**
+
+1. Keychain checks if an `ssh-agent` is already running
+2. If not, it starts one for you
+3. It loads your private key (prompting for the passphrase once)
+4. It writes the agent's connection info to `~/.keychain/`
+5. Every new shell after that reconnects automatically — **no more prompts**
+
+**Verify it worked:**
+
+```bash
+keychain list
+```
+
+You should see your key listed. Open a new terminal and run it again — still there, no passphrase needed. Use your SSH keypair to access a remote system. No passphrase is required.
+
+> **Note:** No configuration file needed. Keychain works perfectly with zero setup. The optional `.keychainrc` file is for advanced customization only.
+
+---
+
+## Why Keychain Exists
+
+For those who may not be familiar with `ssh-agent`, it's worth understanding **why** we're doing this. The concepts come from Daniel's original IBM developerWorks articles on OpenSSH key management.
+
+### From Passwords to SSH Keys
+
+The simplest way to log in to a remote system is with a password: you type a secret, the encrypted SSH session carries it to the server, and the server checks it. SSH keys use a stronger model. Instead of proving your identity by presenting the same secret to the server each time, SSH uses **public-key cryptography** (also called asymmetric cryptography):
+
+- You generate an SSH **key pair**: one public key, one private key.
+- The **public key** can be shared freely — you put it on a remote system, in `~/.ssh/authorized_keys`, which grants you access.
+- Your **private key** stays on your local machine, and never leaves.
+- You can then access the remote system from your local machine, **without entering a password**.
+
+This also means:
+- **No passwords sent over the network** — authentication happens via cryptographic proof
+- **Stronger security** — a 4096-bit RSA key is far harder to crack than any password
+- **Automation-friendly** — scripts can authenticate without storing passwords
+
+### Why Encrypt Your Private Key?
+
+Your private key is stored in `~/.ssh/id_ed25519` (or similar). If someone steals this file, they can impersonate you on any server that has your public key.
+
+**The Improvement:** You encrypt the private key on disk with a passphrase. Now even if stolen, it's useless without the passphrase. It's much safer, but comes with a catch.
+
+**The new problem:** Now the server no longer needs your login password, but your local machine still needs the passphrase that decrypts your private key. Without an agent, that passphrase is needed every time the key is used. Open a new terminal? Enter it again. Run a cron job? It cannot prompt. You *could* remove the passphrase from the private key, but then anyone who steals the file can use it.
+
+**Enter ssh-agent:** `ssh-agent` is distributed with OpenSSH. It's a background process that holds your decrypted private key in memory. You enter the passphrase only once; `ssh-agent` caches your private key, and OpenSSH asks `ssh-agent` for it each time, instead of having to prompt *you*.
+
+**The next problem:** `ssh-agent` is just a process with a socket. You still need to start it at the right time, publish its environment to future shells, keep scripts and cron jobs pointed at it, and avoid races when several terminals initialize at once.
+
+**Enter Keychain:** Keychain turns `ssh-agent` into a reliable shared service
+by handling startup, reuse, stable sockets, shell exports, cron access, and
+coordinated activation across terminals. It also integrates native
+GnuPG signing and decryption workflows without managing `gpg-agent` or using
+GnuPG as an SSH-agent replacement.
+
+---
+
+## A Tool That Respects Your Intelligence ⭐
+
+Most CLI tools ask you to trust them. Keychain 3 asks you to understand it. We believe you deserve:
+
+- **Transparency:** See exactly how the tool interprets your commands before they run
+- **Visibility:** Inspect internal state when troubleshooting, not just error messages
+- **Cooperation:** Work with your actual multi-terminal workflows, not idealized single-shell scenarios
+- **Self-documentation:** Complete reference always available, version-matched to your installation
+
+### 1. Multi-Terminal Coordination
+
+When multiple terminals start simultaneously (like when VS Code reconnects to WSL, or you log in via Linux desktop or terminal login), `ssh-agent` or an ad-hoc `ssh-agent` wrapper might start multiple `ssh-agent` processes, which all need to cache your private key and prompt you for your passphrase.
+
+**Keychain 3 supports a new, robust coordinated activation sequence.** All terminals cooperate:
+
+```
+Terminal 1:  ▸ Press Enter to run ssh-add in this terminal
+Terminal 2:  ▸ Press Enter to run ssh-add in this terminal
+Terminal 3:  ▸ Press Enter to run ssh-add in this terminal
+```
+
+Press Enter in **any** terminal. That terminal runs `ssh-add` and prompts for your passphrase. The other terminals wait automatically and are notified when complete:
+
+```
+Terminal 2:  Keys initialized by another terminal.
+Terminal 3:  Keys initialized by another terminal.
+```
+
+**Stuck prompt?** Press Enter in any waiting terminal to move the passphrase request there. Keychain cancels the previous request before starting its replacement.
+
+This is a new feature for Keychain 3 and differs from the default behavior of Keychain 2. For legacy automatic shell startup without Keychain's preliminary Enter prompt, add `--immediate`. OS packagers can make this the default behavior at build-time if desired (see [Build-Time Activation Default](#build-time-activation-default)).
+
+### 2. Embedded Documentation
+
+No more hunting for man pages or browsing outdated wikis. You deserve complete reference documentation that:
+
+```bash
+keychain man              # Full manual in your pager
+keychain man --list       # Index of all topics and actions
+keychain man add          # Documentation for 'add' action
+keychain man topic:coordination  # Multi-terminal coordination docs
+```
+
+- Is always available, even offline
+- Matches your exact version
+- Covers every option, config key, and concept
+
+### 3. --explain Mode
+
+Not sure what a command will do? You deserve to see the tool's reasoning. Append `--explain` and Keychain shows you **exactly** how it interprets your command-line, which documentation applies, and what each option does:
+
+```bash
+keychain add --quick --eval ~/.ssh/id_ed25519 --explain
+```
+
+Output shows documentation boxes for the action and every recognized option, then exits without doing anything. This is transparency in action — the tool shows its work before acting.
+
+### 4. keychain inspect
+
+When things go wrong, you deserve better than "trust me, it's working." `keychain inspect` gives you a complete, structured snapshot of Keychain's internal state:
+
+```bash
+keychain inspect
+```
+
+Shows:
+- Platform and host detection
+- Keychain and Python runtime details
+- Parsed preferences and their effective sources
+- Keychain-relevant environment state
+- SSH and GPG tool availability
+- Agent status and socket locations
+- Keychain directory and pidfile state
+- Ownership and permission checks
+- Loaded SSH keys from the best available agent
+
+Add `--json` for machine-readable output suitable for bug reports or automation.
+
+> **These four features reflect a simple belief:** Tools should serve you with transparency and cooperation, not demand that you adapt to their limitations.
+
+---
+
+## Common Workflows
+
+### First-Time Setup
+
+Use the recipe for your shell in [60-Second Quick Start](#60-second-quick-start), and edit `KEYCHAIN_KEYS` to select your keys. The startup checks keep key-loading prompts in interactive terminals.
+
+Next interactive login: you'll be prompted once, then subsequent shells reconnect to the same agent.
+
+### Adding Another Key
+
+Already running Keychain and want to add a second key?
+
+```bash
+keychain add ~/.ssh/id_rsa_work
+```
+
+Keychain will load the new key into the existing agent.
+
+### Checking What's Loaded
+
+```bash
+keychain list
+```
+
+For machine-readable output:
+
+```bash
+keychain list --json
+```
+
+### Clearing Cached Credentials
+
+To remove all identities from `ssh-agent` while leaving the agent running:
+
+```bash
+keychain wipe
+```
+
+The equivalent explicit form is `keychain wipe --ssh`.
+
+To flush only `gpg-agent`'s entire in-memory secret cache:
+`keychain wipe --gpg`
+
+To perform both operations: `keychain wipe --ssh --gpg`
+
+### Using with Cron
+
+Cron jobs can't prompt for passphrases. Source the pidfile in your script:
+
+```bash
+#!/bin/bash
+. ~/.keychain/$(hostname)-sh
+
+# Now you can use ssh/scp/rsync without prompting
+rsync -avz /path/to/data user@remote:/backup/
+```
+
+If a cron job invokes Keychain directly, use `--noask` so Keychain will not try to prompt in the cron context.
+
+---
+
+## Configuration (Optional)
+
+**You don't need a config file.** Keychain works great with defaults.
+
+But if you want to customize behavior, create `~/.keychainrc`:
+
+```ini
+# ~/.keychainrc — completely optional
+
+[output]
+quiet = true
+theme = modern
+
+[agent]
+timeout = 480               # Auto-expire keys after 8 hours
+confirm = true              # Ask before each SSH key use
+
+[paths]
+pid_formats = sh,envfile    # Write both shell and env-file formats
+```
+
+### Most Useful Settings
+
+| Setting | What It Does |
+|---------|--------------|
+| `agent.timeout = 480` | Auto-expire keys after N minutes |
+| `agent.confirm = true` | Require confirmation for each SSH key use |
+| `paths.pid_formats = sh,envfile` | Write both shell and env-file formats |
+
+### Full Configuration Reference
+
+```bash
+keychain man topic:config
+```
+
+Or browse all config keys:
+
+```bash
+keychain man --list
+```
+
+---
+
+## Advanced Features
+
+### Hardware-Backed SSH Keys (PKCS#11)
+
+Using a YubiKey or other PKCS#11 token?
+
+```bash
+keychain add pkcs11:/path/to/provider.so
+```
+
+Keychain will enumerate the token's keys and load the provider via `ssh-add -s`.
+
+### systemd Integration
+
+Need your user services to access the SSH agent? From an interactive terminal, run:
+
+```bash
+eval "$(keychain add --eval --systemd ~/.ssh/id_ed25519)"
+```
+
+This pushes the agent environment to `systemctl --user`, making it available to all your user services.
+
+For automatic startup, add `--systemd` to both Keychain invocations in the Bash or fish Quick Start recipe. The non-interactive branch retains `--noask` so it can publish the agent environment without prompting.
+
+## Upgrading from Keychain 2.x
+
+**Good news:** Your existing shell snippets still work.
+
+Keychain 3 accepts the traditional 2.x invocation:
+
+```bash
+eval `keychain --eval --quiet id_rsa`
+```
+
+The flags remain supported. For shell startup, use the guarded recipes in [60-Second Quick Start](#60-second-quick-start): an unconditional invocation can wait for input during a non-interactive login, in Keychain 2 as well as Keychain 3.
+
+**What's new:**
+
+- The action-driven interface (`keychain add`, `keychain agent start`) is now recommended
+- Multi-terminal coordination eliminates lock errors
+- Embedded documentation (`keychain man`) replaces the need for external man pages
+- `.keychainrc` replaces environment variables for persistent preferences
+
+**Migration tip:** The equivalent commands below show the syntax change. For your startup file, use the full recipe above rather than copying either command unconditionally:
+
+```bash
+# Old (still works)
+eval `keychain --eval id_rsa`
+
+# New (recommended)
+eval "$(keychain add --eval ~/.ssh/id_rsa)"
+```
+
+## OS/Distribution Build and Packaging Options
+
+This section covers alternative ways to install and build Keychain. It is primarily intended for Operating System/Linux distribution package maintainers, but may also be of interest to advanced users.
+
+### Standard Python Installation
+
+Besides a pre-built zipapp deployment, you can also install from a Keychain source checkout or extracted source release using standard Python packaging. For example, on Linux or macOS:
+
+```bash
+python3 -m venv .install
+.install/bin/python -m pip install .
+.install/bin/keychain version
+```
+
+For distribution packaging, Keychain uses a setuptools-based PEP 517 build backend. Run `python3 -m build` with the distribution's selected Python interpreter to produce a source distribution and a wheel built from it. Install the wheel using the distribution's normal packaging tools; they can select the installed interpreter and compile bytecode for it. There are no third-party Python runtime dependencies.
+
+The build frontend (`build`) is a build-time dependency. For offline builds, provide the dependencies from `[build-system].requires` in `pyproject.toml` and run `python3 -m build --no-isolation`. The backend generates the embedded documentation automatically. The installed `keychain` command and `python3 -m keychain` both use the same application entry point.
+
+The portable zipapp remains a source-only, single-file alternative that runs across supported Python versions. A normal Python installation lets the distribution manage interpreter-specific bytecode without putting it in the zipapp.
+
+### Manual Page
+
+`keychain man --roff` generates a conventional UTF-8 man page from the same documentation used by `keychain man`. Releases include `keychain.1` alongside the zipapp, with both files covered by `SHA256SUMS`. From a source checkout, `make keychain.1` builds it; `make` builds both the zipapp and manual.
+
+To stage the manual for a distribution package:
+
+```bash
+make install-man PREFIX=/usr DESTDIR="$PWD/package"
+```
+
+This installs only the manual, at `package/usr/share/man/man1/keychain.1`, with mode `0644`. Without overrides, the destination is `/usr/local/share/man/man1/keychain.1`; `MANDIR` overrides the manual directory, and `DESTDIR` supplies a staging root without changing the final installation path. Installing into a system directory may require elevated privileges.
+
+A Python wheel installation does not install the conventional man page. Package maintainers can install the supplied page separately or generate it with the installed `keychain man --roff` command. Set `SOURCE_DATE_EPOCH` when generating the page to fix its header date for reproducible builds; release builds use the release commit's timestamp. `groff` is used for rendering tests, not required to generate the page.
+
+### Precompiled Zipapp
+
+If you control which Python interpreter will run Keychain, you can build `keychain-precompiled.pyz`. It contains the same application as the portable zipapp, plus Python bytecode compiled ahead of time for your selected interpreter. This is useful for local installations as well as distribution packages:
+
+```bash
+make precompiled-pyz PYTHON=/usr/bin/python3.11
+```
+
+The executable's shebang defaults to the selected interpreter's absolute path, so launching it directly uses that interpreter instead of whichever `python3` happens to be on `PATH`. Python is still required: this is not a native executable or a bundled Python runtime. `PYTHON` selects the interpreter for documentation generation, compilation, and zipapp creation.
+
+If the installed interpreter has a different path from the build interpreter, add `PYZ_INTERPRETER=/usr/bin/python3.11` to the build command. The two interpreters must use the same Python bytecode format. Rebuild when changing Python minor versions. Running the archive explicitly with a different Python interpreter overrides its shebang; incompatible bytecode is ignored and the retained source is compiled instead.
+
+This build keeps the source for auditing and places `.pyc` files alongside it, where Python's ZIP importer can use them. It precompiles at normal optimization level, without stripping assertions or docstrings. This avoids source compilation at startup with the matching interpreter; it does not make application operations inherently faster. `make keychain.pyz` and `make release-artifacts` still produce the source-only portable zipapp, independently of the precompiled artifact.
+
+### Build-Time Activation Default
+
+Keychain 3.x features a coordinated activation system which is technically superior to the classic "race" startup of Keychain 2.x, but OS/distribution maintainers may prefer classic 2.x behavior to be the default. It is possible to build Keychain to make classic behavior the default, without removing the option for users to enable coordinated activation via `~/.keychainrc`:
+
+```bash
+make keychain.pyz DEFAULT_ACTIVATION=immediate
+make precompiled-pyz DEFAULT_ACTIVATION=immediate PYTHON=/usr/bin/python3.11
+```
+
+For standard Python packages, use `KEYCHAIN_BUILD_ACTIVATION=immediate python3 -m build`. The generated default is written into the build output, leaving the source checkout unchanged. This allows the use of a build-time flag, such as a Gentoo USE flag, to select the chosen runtime default.
+
+Users can override either package default in `~/.keychainrc`:
+
+```ini
+[agent]
+activation = prompt
+```
+
+The classic 2.x behavior corresponds with `activation = immediate`, which skips the initial Enter prompt. `--immediate` overrides the configuration for one invocation. The old `immediate = true/false` config key remains accepted, but `.keychainrc` `activation =` takes precedence with a warning when both are present. Immediate activation still coordinates across terminals and can require a passphrase but the first terminal to prompt for a passphrase is not deterministic.
+
+## Historical Notes
+
+Keychain was created by **Daniel Robbins** in 2001 and introduced to the world through a trilogy of IBM developerWorks articles on OpenSSH key management. These articles became the definitive introduction to SSH agent management for a generation of system administrators.
+
+**Development timeline:**
+
+- **2001-2003**: Original creation and maintenance by Daniel Robbins
+- **2003-2007**: Maintained by Gentoo Linux developers (Seth Chandler, Mike Frysinger, Robin H. Johnson, Aron Griffis)
+- **2009-2017**: Daniel resumes maintenance via Funtoo Linux project
+- **2017-2025**: Various maintainers, periods of limited activity
+- **2025-present**: Daniel returns as maintainer, begins Python 3 rewrite
+
+### The IBM developerWorks Articles
+
+Daniel's original trilogy remains valuable reading for understanding SSH key management concepts:
+
+- [**Part 1: Understanding RSA/DSA Authentication**](https://www.funtoo.org/OpenSSH_Key_Management,_Part_1) — The cryptography basics
+- [**Part 2: Introducing ssh-agent and keychain**](https://www.funtoo.org/OpenSSH_Key_Management,_Part_2) — Agent management fundamentals
+- [**Part 3: Agent forwarding and improvements**](https://www.funtoo.org/OpenSSH_Key_Management,_Part_3) — Advanced workflows
+
+For background on the Keychain 3 rewrite decision, see [Why Keychain 3 Uses Python](https://kernel-seeds.org/projects/keychain/why-python/).
+
+**Current project home:** [kernel-seeds.org/projects/keychain](https://kernel-seeds.org/projects/keychain/)
+
+---
+
+## Troubleshooting
+
+### "Could not acquire lock" Errors
+
+**This should not happen in Keychain 3.** If you see this, you may be running an older version. Upgrade to 3.0.0 or newer for multi-terminal coordination.
+
+### Keys Not Persisting Across Reboots
+
+This is expected behavior. Keychain caches keys in memory (via `ssh-agent`) for security. After a reboot, you'll need to enter your passphrase once again.
+
+### Wrong Key Loaded
+
+Check which keys are currently loaded:
+
+```bash
+keychain list
+```
+
+To clear and reload:
+
+```bash
+keychain wipe
+keychain add ~/.ssh/id_correct_key
+```
+
+### Cron Jobs Failing
+
+Ensure your cron script sources the pidfile:
+
+```bash
+. ~/.keychain/$(hostname)-sh
+```
+
+If the cron job invokes Keychain directly, include `--noask` so it cannot block waiting for a passphrase prompt.
+
+---
+
+## Getting Help
+
+- **Embedded manual:** `keychain man` or `keychain man --list`
+- **Explain mode:** Append `--explain` to any command
+- **Project documentation:** https://kernel-seeds.org/projects/keychain/
+- **Source & issues:** https://github.com/danielrobbins/keychain
+- **Discussions:** https://github.com/danielrobbins/keychain/discussions
+
+---
+
+## License
+
+Keychain 3.x is released under the **GPLv3** license.
+
+Previous Keychain 2.x releases remain under **GPLv2**.
+
+---
+
+*Keychain 3 — Continuing a 25-year tradition of thoughtful Unix tool design.*
+Created and maintained by Daniel Robbins.
